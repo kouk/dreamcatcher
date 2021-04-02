@@ -1,3 +1,5 @@
+const otel = require('@opentelemetry/api');
+const tracer = require('./tracer')('dreamcatcher');
 const express = require("express");
 const logger = require("morgan");
 const Url = require("url");
@@ -21,6 +23,23 @@ const {
 
 
 const MAX_RETRIES_WHEN_ERROR = 3;
+
+
+const withNamedSpan = (name, f) => {
+  return async function() {
+    return await tracer.startActiveSpan(name, async (span) => {
+      try {
+        return await f.apply(this, arguments)
+      } catch (e) {
+        span.recordException(e)
+        span.setStatus({ code: otel.SpanStatusCode.ERROR, message: String(e) })
+        throw e;
+      } finally {
+        span.end()
+      }
+    });
+  }
+}
 
 const commonSetup = async (page, options) => {
   if (process.env.ALLOW_PRIVATE_NETWORKS !== 'true') {
@@ -49,16 +68,16 @@ const screenshotTask = async ({ page, data: {options, format}}) => {
     });
   }
 
-  await commonSetup(page, options);
-  await prepareContent(page, options);
+  await withNamedSpan('commonSetup', commonSetup)(page, options);
+  await withNamedSpan('prepareContent', prepareContent)(page, options);
 
   let result;
   if (format === 'content') {
-    result = await captureContent(page, options);
+    result = await withNamedSpan('captureContent', captureContent)(page, options);
   } else if (format === 'pdf') {
-    result = await capturePdf(page, options);
+    result = await withNamedSpan('capturePdf', capturePdf)(page, options);
   } else {
-    result = await captureImage(page, options);
+    result = await withNamedSpan('captureImage', captureImage)(page, options);
   }
   if (useSentry) {
     transaction.finish();
@@ -139,12 +158,15 @@ if (useSentry) {
     try {
       const options = prepareOptions(req.body);
       const payload = await retry(
-        async () => {
+        withNamedSpan('export', async () => {
+          const currentSpan = otel.trace.getSpan(otel.context.active());
+          if (currentSpan)
+            currentSpan.addEvent(`invoking export in cluster with ${req.params.format}`);
           return await cluster.execute(
             {options, format: req.params.format},
-            screenshotTask
+            withNamedSpan('screenshotTask', screenshotTask)
           );
-        },
+        }),
         {
           retries: MAX_RETRIES_WHEN_ERROR,
           onRetry: (error) => {
